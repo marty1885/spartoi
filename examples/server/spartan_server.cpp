@@ -1,5 +1,5 @@
 #include <drogon/drogon.h>
-#include <spartoi/SpartanServerPlgin.hpp>
+#include <spartoi/SpartanServerPlugin.hpp>
 #include <memory>
 #include <random>
 #include <string>
@@ -39,7 +39,7 @@ int main()
         [](const HttpRequestPtr& req,
            std::function<void (const HttpResponsePtr &)> &&callback)
         {
-            const auto& input = req->body();
+            const auto& input = req->getParameter("query");
             if(input.empty())
             {
                 auto resp = HttpResponse::newHttpResponse();

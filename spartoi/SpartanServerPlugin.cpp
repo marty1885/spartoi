@@ -1,4 +1,4 @@
-#include "SpartanServerPlgin.hpp"
+#include "SpartanServerPlugin.hpp"
 #include "SpartanServer.hpp"
 #include <drogon/HttpAppFramework.h>
 #include <drogon/utils/Utilities.h>
