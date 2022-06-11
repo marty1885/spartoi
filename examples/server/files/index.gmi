@@ -1,0 +1,15 @@
+# Spartoi example server
+
+Welcome to the Spartoi example server. This is a basic Spartan Server with some server side scripting. Mostly to demo how to do stuff in Spartoi.
+
+Another Spartan page
+=> /another_page.gmi Anohter page
+
+Generate a random number between 0 and 1000
+=> /random_number A random number generator
+
+Get the curent UNIX epoch
+=> /unix_epoch UNIX epoch in seconds
+
+Asks for user input and echo it
+=> /user_input User input
