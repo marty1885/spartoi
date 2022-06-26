@@ -81,7 +81,7 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 			return;
 		}
 		if(buf->readableBytes() >= content_length) {
-			req->setBody(std::string(buf->peek(), content_length));
+			req->setParameter("query", std::string(buf->peek(), content_length));
 			finished = true;
 			processFinishedRequest(req, conn);
 		}
@@ -119,7 +119,7 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 	}
 	else {
 		if(buf->readableBytes() >= content_length) {
-			req->setBody(std::string(buf->peek(), content_length));
+			req->setParameter("query", std::string(buf->peek(), content_length));
 			state.request_finished = true;
 			conn->setContext(std::make_shared<SpartanParseState>(state));
 			processFinishedRequest(req, conn);
