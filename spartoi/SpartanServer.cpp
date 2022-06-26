@@ -92,16 +92,21 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 	if(crlf == nullptr)
 		return;
 	std::string header(buf->peek(), crlf);
-	auto [req, content_length] = parseHeader(header);
-	buf->retrieve(std::distance(buf->peek(), crlf + 2));
-
-	if(req == nullptr) {
+	HttpRequestPtr req;
+	size_t content_length;
+	try {
+		std::tie(req, content_length) = parseHeader(header);
+	}
+	catch(std::exception& e) {
 		LOG_WARN << "Invalid header: " << header;
 		auto resp = HttpResponse::newHttpResponse();
-        resp->setStatusCode((HttpStatusCode)500);
+        resp->setStatusCode(k500InternalServerError);
         resp->addHeader("meta", "Invalid request header");
         sendResponseBack(conn, resp);
+		return;
 	}
+
+	buf->retrieve(std::distance(buf->peek(), crlf + 2));
 	LOG_TRACE << "Spartan request recived. Header: " << header;
 
 	SpartanParseState state;
