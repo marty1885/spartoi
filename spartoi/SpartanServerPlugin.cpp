@@ -57,5 +57,6 @@ void SpartanServerPlugin::initAndStart(const Json::Value& config)
 
 void SpartanServerPlugin::shutdown()
 {
+	for(auto &server : servers_)
+		server->stop();
 }
-

@@ -10,6 +10,11 @@
 
 using namespace drogon;
 
+namespace
+{
+constexpr size_t kMaxResponseHeaderBytes = 1024;
+}
+
 static bool isIPString(const std::string& str)
 {
     bool isIpV6 = str.find(":") != std::string::npos;
@@ -239,30 +244,49 @@ void SpartanClient::sendRequestInLoop()
 void SpartanClient::onRecvMessage(const trantor::TcpConnectionPtr &connPtr,
               trantor::MsgBuffer *msg)
 {
-    if(timeout_ > 0)
-        loop_->invalidateTimer(timeoutTimerId_);
-    LOG_TRACE << "Got data from Spartan server";
-    if(!headerReceived_)
-    {
-        const char* crlf = msg->findCRLF();
-        if(crlf == nullptr)
-        {
-            return;
-        }
-        headerReceived_ = true;
+	if(headerReceived_ && timeout_ > 0)
+		loop_->invalidateTimer(timeoutTimerId_);
+	LOG_TRACE << "Got data from Spartan server";
+	if(!headerReceived_)
+	{
+		const auto scanStart = msg->peek() + std::min(headerScanOffset_, msg->readableBytes());
+		const char crlfBytes[] = {'\r', '\n'};
+		const auto crlf = std::search(scanStart, msg->peek() + msg->readableBytes(),
+		                              std::begin(crlfBytes), std::end(crlfBytes));
+		if(crlf == msg->peek() + msg->readableBytes())
+		{
+			if(msg->readableBytes() > kMaxResponseHeaderBytes)
+			{
+				haveResult(ReqResult::BadResponse, nullptr);
+				connPtr->forceClose();
+				return;
+			}
+			headerScanOffset_ = msg->readableBytes() == 0 ? 0 : msg->readableBytes() - 1;
+			return;
+		}
+		const auto headerBytes = static_cast<size_t>(crlf - msg->peek());
+		if(headerBytes + 2 > kMaxResponseHeaderBytes)
+		{
+			haveResult(ReqResult::BadResponse, nullptr);
+			connPtr->forceClose();
+			return;
+		}
+		headerReceived_ = true;
+		if(timeout_ > 0)
+			loop_->invalidateTimer(timeoutTimerId_);
 
-        const std::string_view header(msg->peek(), std::distance(msg->peek(), crlf));
-        LOG_TRACE << "Spartan header is: " << header;
-        if(header.size() < 1 || (header.size() >= 2 && header[1] != ' '))
-        {
-            // bad response
-            haveResult(ReqResult::BadResponse, nullptr);
-            return;
-        }
+		const std::string_view header(msg->peek(), headerBytes);
+		LOG_TRACE << "Spartan header is: " << header;
+		if(header.size() < 2 || header[1] != ' ' || header[0] < '2' || header[0] > '5')
+		{
+			// bad response
+			haveResult(ReqResult::BadResponse, nullptr);
+			connPtr->forceClose();
+			return;
+		}
 
-        responseStatus_ = std::stoi(std::string(header.begin(), header.begin()+1));
-        if(header.size() >= 4)
-            resoneseMeta_ = std::string(header.begin()+2, header.end());
+		responseStatus_ = header[0] - '0';
+		resoneseMeta_ = std::string(header.substr(2));
         if(!downloadMimes_.empty() && responseStatus_ == 2)
         {
             std::string mime = resoneseMeta_.substr(0, resoneseMeta_.find_first_of("; ,"));
@@ -273,15 +297,15 @@ void SpartanClient::onRecvMessage(const trantor::TcpConnectionPtr &connPtr,
                 return;
             }
         }
-        msg->read(std::distance(msg->peek(), crlf)+2);
-    }
+		msg->retrieve(headerBytes + 2);
+	}
     if(maxBodySize_ > 0 && msg->readableBytes() > size_t(maxBodySize_))
     {
         LOG_DEBUG << "Recived more data than " << maxBodySize_ << " bites";
         // bad response
-        haveResult(ReqResult::BadResponse, nullptr);
-
-        return;
+		haveResult(ReqResult::BadResponse, nullptr);
+		connPtr->forceClose();
+		return;
     }
 
     if(timeout_ > 0)

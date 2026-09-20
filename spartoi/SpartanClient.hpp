@@ -9,6 +9,7 @@
 #include <trantor/net/callbacks.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <stdexcept>
 
@@ -83,34 +84,50 @@ protected:
     std::vector<std::string> downloadMimes_;
     trantor::TimerId transferTimerId_;
     bool callbackCalled_ = false;
+    size_t headerScanOffset_ = 0;
 };
 
 }
 
-void sendRequest(const std::string& url, const drogon::HttpReqCallback& callback, double timeout = 0
-    , trantor::EventLoop* loop=drogon::app().getLoop(), intmax_t maxBodySize = -1, const std::vector<std::string>& mimes = {}
-    , double maxTransferDuration=0);
+void sendRequest(const std::string& url, const drogon::HttpReqCallback& callback, double timeout = 10
+	, trantor::EventLoop* loop=drogon::app().getLoop(), intmax_t maxBodySize = 0x2000000, const std::vector<std::string>& mimes = {}
+	, double maxTransferDuration=900);
 
 #ifdef __cpp_impl_coroutine
 namespace internal
 {
 
-struct [[nodiscard]] SpartanRespAwaiter : public drogon::CallbackAwaiter<drogon::HttpResponsePtr>
+struct [[nodiscard]] SpartanRespAwaiter
 {
-    SpartanRespAwaiter(std::string url, trantor::EventLoop* loop, double timeout = 10, intmax_t maxBodySize = -1, const std::vector<std::string>& mimes = {}
-        , double maxTransferDuration=0)
-        : url_(url), loop_(loop), timeout_(timeout), maxBodySize_(maxBodySize), mimes_(mimes), maxTransferDuration_(maxTransferDuration)
-    {
-    }
+	SpartanRespAwaiter(std::string url, trantor::EventLoop* loop, double timeout = 10, intmax_t maxBodySize = 0x2000000, const std::vector<std::string>& mimes = {}
+		, double maxTransferDuration=900)
+		: url_(url), loop_(loop), timeout_(timeout), maxBodySize_(maxBodySize), mimes_(mimes), maxTransferDuration_(maxTransferDuration)
+	{
+	}
 
-    void await_suspend(std::coroutine_handle<> handle)
-    {
-        using namespace drogon;
-        sendRequest(url_, [this, handle](ReqResult res, HttpResponsePtr resp){
-            if (res == ReqResult::Ok)
-                setValue(resp);
-            else
-            {
+	SpartanRespAwaiter(const SpartanRespAwaiter&) = delete;
+	SpartanRespAwaiter& operator=(const SpartanRespAwaiter&) = delete;
+	SpartanRespAwaiter(SpartanRespAwaiter&&) = default;
+	SpartanRespAwaiter& operator=(SpartanRespAwaiter&&) = default;
+
+	bool await_ready() const noexcept
+	{
+		return false;
+	}
+
+	void await_suspend(std::coroutine_handle<> handle)
+	{
+		using namespace drogon;
+		state_->handle = handle;
+		std::weak_ptr<State> weakState = state_;
+		sendRequest(url_, [weakState](ReqResult res, HttpResponsePtr resp){
+			auto state = weakState.lock();
+			if(!state)
+				return;
+			if (res == ReqResult::Ok)
+				state->response = std::move(resp);
+			else
+			{
                 std::string reason;
                 if (res == ReqResult::BadResponse)
                     reason = "BadResponse";
@@ -124,26 +141,40 @@ struct [[nodiscard]] SpartanRespAwaiter : public drogon::CallbackAwaiter<drogon:
                     reason = "HandshakeError";
                 else if(res == ReqResult::InvalidCertificate)
                     reason = "InvalidCertificate";
-                setException(
-                    std::make_exception_ptr(std::runtime_error(reason)));
-            }
-            handle.resume();
-        }, timeout_, loop_, maxBodySize_, mimes_, maxTransferDuration_);
-    }
+				state->exception = std::make_exception_ptr(std::runtime_error(reason));
+			}
+			state->handle.resume();
+		}, timeout_, loop_, maxBodySize_, mimes_, maxTransferDuration_);
+	}
+
+	drogon::HttpResponsePtr await_resume()
+	{
+		if(state_->exception)
+			std::rethrow_exception(state_->exception);
+		return std::move(*state_->response);
+	}
 
 private:
-    std::string url_;
+	struct State
+	{
+		std::optional<drogon::HttpResponsePtr> response;
+		std::exception_ptr exception;
+		std::coroutine_handle<> handle;
+	};
+
+	std::string url_;
     trantor::EventLoop* loop_;
     double timeout_;
     intmax_t maxBodySize_;
-    std::vector<std::string> mimes_;
-    double maxTransferDuration_;
+	std::vector<std::string> mimes_;
+	double maxTransferDuration_;
+	std::shared_ptr<State> state_ = std::make_shared<State>();
 };
 }
 
 inline internal::SpartanRespAwaiter sendRequestCoro(const std::string& url, double timeout = 10
-    , trantor::EventLoop* loop=drogon::app().getLoop(), intmax_t maxBodySize = -1, const std::vector<std::string>& mimes = {}
-    , double maxTransferDuration = 0)
+	, trantor::EventLoop* loop=drogon::app().getLoop(), intmax_t maxBodySize = 0x2000000, const std::vector<std::string>& mimes = {}
+	, double maxTransferDuration = 900)
 {
     return internal::SpartanRespAwaiter(url, loop, timeout, maxBodySize, mimes, maxTransferDuration);
 }
