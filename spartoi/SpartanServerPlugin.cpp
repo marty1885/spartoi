@@ -14,14 +14,15 @@ using namespace trantor;
 void SpartanServerPlugin::initAndStart(const Json::Value& config)
 {
     int numThread = config.get("numThread", 1).asInt();
-    if(numThread < 0)
+    if(numThread < 1)
     {
         LOG_FATAL << "numThread must be latger or equal to 1";
         exit(1);
     }
 
     pool_ = std::make_shared<trantor::EventLoopThreadPool>(numThread, "SpartanServerThreadPool");
-
+    pool_->start();
+    auto limits = std::make_shared<SpartanConnectionLimits>();
 
     const auto& listeners = config["listeners"];
     if(listeners.isNull())
@@ -47,10 +48,12 @@ void SpartanServerPlugin::initAndStart(const Json::Value& config)
                 LOG_FATAL << ip << " is not a valid IP address";
             }
 
-            auto server = std::make_unique<SpartanServer>(app().getLoop(), addr);
-            server->setIoLoopThreadPool(pool_);
-            server->start();
-            servers_.emplace_back(std::move(server));
+            for(auto* loop : pool_->getLoops())
+            {
+                auto server = std::make_unique<SpartanServer>(loop, addr, limits);
+                server->start();
+                servers_.emplace_back(std::move(server));
+            }
         }
     }
 }
@@ -59,4 +62,6 @@ void SpartanServerPlugin::shutdown()
 {
 	for(auto &server : servers_)
 		server->stop();
+	servers_.clear();
+	pool_.reset();
 }

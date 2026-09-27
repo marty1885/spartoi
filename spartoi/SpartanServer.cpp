@@ -1,8 +1,10 @@
 #include "SpartanServer.hpp"
+#include "SpartanServerPlugin.hpp"
 #include <drogon/HttpAppFramework.h>
 #include <algorithm>
 #include <charconv>
 #include <memory>
+#include <mutex>
 #include <system_error>
 
 using namespace drogon;
@@ -15,19 +17,109 @@ constexpr size_t kMaxRequestHeaderBytes = 8 * 1024;
 constexpr size_t kMaxRequestBodyBytes = 32 * 1024 * 1024;
 constexpr size_t kMaxConnections = 256;
 constexpr double kRequestDeadlineSeconds = 60;
+constexpr size_t kMaxHttpResponses = 16;
+constexpr size_t kMaxHttpInputBytes = 16 * 1024;
+constexpr size_t kMaxHttpResponseHeaderBytes = 8 * 1024;
+constexpr size_t kMaxHttpBodyBytes = 64 * 1024;
+constexpr size_t kHttpSendSteps = 16;
+constexpr double kHttpStepSeconds = 2;
+std::mutex accidentalHttpHandlerMutex;
+AccidentalHttpHandler accidentalHttpHandler;
+
+AccidentalHttpHandler getAccidentalHttpHandler()
+{
+	std::lock_guard<std::mutex> lock(accidentalHttpHandlerMutex);
+	return accidentalHttpHandler;
 }
 
-SpartanServer::SpartanServer(EventLoop* loop, const InetAddress& listenAddr)
-    : loop_(loop), server_(loop, listenAddr, "SpartanServer")
+bool validHttpFieldValue(std::string_view value)
+{
+	return std::none_of(value.begin(), value.end(), [](unsigned char c) {
+		return (c < 0x20 && c != '\t') || c == 0x7f;
+	});
+}
+
+HttpRequestPtr parseHttpRequestLine(std::string_view line)
+{
+	const auto firstSpace = line.find(' ');
+	const auto secondSpace = firstSpace == std::string_view::npos
+	                       ? std::string_view::npos : line.find(' ', firstSpace + 1);
+	if(firstSpace == std::string_view::npos || secondSpace == std::string_view::npos ||
+	   line.find(' ', secondSpace + 1) != std::string_view::npos)
+		return {};
+	const auto method = line.substr(0, firstSpace);
+	const auto target = line.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+	const auto version = line.substr(secondSpace + 1);
+	if(target.empty() || target.front() != '/' ||
+	   (version != "HTTP/1.0" && version != "HTTP/1.1") ||
+	   !std::all_of(target.begin(), target.end(), [](unsigned char c) {
+		return c >= 0x21 && c <= 0x7e;
+	   }))
+		return {};
+
+	HttpMethod httpMethod;
+	if(method == "GET") httpMethod = Get;
+	else if(method == "POST") httpMethod = Post;
+	else if(method == "HEAD") httpMethod = Head;
+	else if(method == "PUT") httpMethod = Put;
+	else if(method == "DELETE") httpMethod = Delete;
+	else if(method == "OPTIONS") httpMethod = Options;
+	else if(method == "PATCH") httpMethod = Patch;
+	else return {};
+
+	auto req = HttpRequest::newHttpRequest();
+	req->setMethod(httpMethod);
+	req->setPathEncode(false);
+	req->setPath(std::string(target.substr(0, target.find('?'))));
+	return req;
+}
+
+const char* httpReason(int status)
+{
+	switch(status)
+	{
+	case 200: return "OK";
+	case 201: return "Created";
+	case 202: return "Accepted";
+	case 204: return "No Content";
+	case 301: return "Moved Permanently";
+	case 302: return "Found";
+	case 303: return "See Other";
+	case 307: return "Temporary Redirect";
+	case 308: return "Permanent Redirect";
+	case 400: return "Bad Request";
+	case 401: return "Unauthorized";
+	case 403: return "Forbidden";
+	case 404: return "Not Found";
+	case 429: return "Too Many Requests";
+	case 500: return "Internal Server Error";
+	case 503: return "Service Unavailable";
+	default: return "";
+	}
+}
+}
+
+void spartoi::registerAccidentalHttpHandler(AccidentalHttpHandler handler)
+{
+	std::lock_guard<std::mutex> lock(accidentalHttpHandlerMutex);
+	accidentalHttpHandler = std::move(handler);
+}
+
+SpartanServer::SpartanServer(EventLoop* loop, const InetAddress& listenAddr,
+                             std::shared_ptr<SpartanConnectionLimits> limits)
+    : server_(loop, listenAddr, "SpartanServer"),
+      limits_(limits ? std::move(limits) : std::make_shared<SpartanConnectionLimits>())
 {
     LOG_DEBUG << "Creating srver on address " << listenAddr.toIpPort();
 
 	server_.setConnectionCallback([this](const TcpConnectionPtr& conn) {onConnection(conn);});
 	server_.setRecvMessageCallback([this](const TcpConnectionPtr& conn, MsgBuffer* buf){onMessage(conn, buf);});
-	server_.kickoffIdleConnections(static_cast<size_t>(kRequestDeadlineSeconds));
 }
 
-SpartanServer::~SpartanServer() = default;
+SpartanServer::~SpartanServer()
+{
+	stop();
+}
 
 void SpartanServer::onConnection(const TcpConnectionPtr& conn)
 {
@@ -37,14 +129,19 @@ void SpartanServer::onConnection(const TcpConnectionPtr& conn)
 		if(state && state->connection_permit)
 		{
 			state->connection_permit = false;
-			activeConnections_.fetch_sub(1, std::memory_order_release);
+			limits_->active_connections.fetch_sub(1, std::memory_order_release);
+		}
+		if(state && state->http_permit)
+		{
+			state->http_permit = false;
+			limits_->active_http_responses.fetch_sub(1, std::memory_order_release);
 		}
 		return;
 	}
 
-	auto current = activeConnections_.load(std::memory_order_relaxed);
+	auto current = limits_->active_connections.load(std::memory_order_relaxed);
 	while(current < kMaxConnections &&
-	      !activeConnections_.compare_exchange_weak(current, current + 1,
+	      !limits_->active_connections.compare_exchange_weak(current, current + 1,
 	                                                std::memory_order_acquire,
 	                                                std::memory_order_relaxed))
 	{}
@@ -63,24 +160,26 @@ void SpartanServer::onConnection(const TcpConnectionPtr& conn)
 		if(!connection || !connection->connected())
 			return;
 		auto parseState = connection->getContext<SpartanParseState>();
-		if(parseState && parseState->phase != SpartanParseState::Phase::Dispatched)
+		if(parseState && parseState->phase != SpartanParseState::Phase::Dispatched &&
+		   parseState->phase != SpartanParseState::Phase::SendingHttpResponse)
 			connection->forceClose();
 	});
 }
 
 void SpartanServer::start()
 {
+	assert(!started_ && !stopped_);
+	started_ = true;
+	server_.kickoffIdleConnections(static_cast<size_t>(kRequestDeadlineSeconds));
     server_.start();
 }
 
 void SpartanServer::stop()
 {
+	if(!started_ || stopped_)
+		return;
+	stopped_ = true;
 	server_.stop();
-}
-
-void SpartanServer::setIoThreadNum(size_t n)
-{
-    server_.setIoLoopNum(n);
 }
 
 std::pair<HttpRequestPtr, size_t> SpartanServer::parseHeader(std::string_view header)
@@ -150,6 +249,173 @@ void SpartanServer::processFinishedRequest(const HttpRequestPtr& req, trantor::T
 	});
 }
 
+void SpartanServer::processAccidentalHttpRequest(HttpRequestPtr req, const TcpConnectionPtr& conn)
+{
+	auto handler = getAccidentalHttpHandler();
+	if(!handler)
+	{
+		conn->forceClose();
+		return;
+	}
+	auto state = conn->getContext<SpartanParseState>();
+	if(!state)
+		return;
+	auto current = limits_->active_http_responses.load(std::memory_order_relaxed);
+	while(current < kMaxHttpResponses &&
+	      !limits_->active_http_responses.compare_exchange_weak(current, current + 1,
+	                                                std::memory_order_acquire,
+	                                                std::memory_order_relaxed))
+	{}
+	if(current >= kMaxHttpResponses)
+	{
+		conn->forceClose();
+		return;
+	}
+	state->http_permit = true;
+	state->http_head_request = req->method() == Head;
+	state->phase = SpartanParseState::Phase::AwaitingHttpResponse;
+	const std::weak_ptr<TcpConnection> weakConn = conn;
+	conn->getLoop()->runAfter(45, [weakConn]() {
+		if(auto connection = weakConn.lock())
+		{
+			auto parseState = connection->getContext<SpartanParseState>();
+			if(parseState && parseState->http_permit)
+				connection->forceClose();
+		}
+	});
+	conn->getLoop()->runAfter(10, [weakConn]() {
+		if(auto connection = weakConn.lock())
+		{
+			auto parseState = connection->getContext<SpartanParseState>();
+			if(parseState && parseState->phase == SpartanParseState::Phase::AwaitingHttpResponse)
+				connection->forceClose();
+		}
+	});
+	const auto threadCount = app().getThreadNum();
+	if(threadCount == 0)
+	{
+		conn->forceClose();
+		return;
+	}
+	const auto idx = roundRobbinIdx_.fetch_add(1, std::memory_order_relaxed) % threadCount;
+	app().getIOLoop(idx)->runInLoop([handler=std::move(handler), req=std::move(req), weakConn]() mutable {
+		try
+		{
+			handler(std::move(req), [weakConn](const HttpResponsePtr& resp) {
+				if(auto connection = weakConn.lock())
+					connection->getLoop()->runInLoop([weakConn, resp]() {
+						SpartanServer::sendAccidentalHttpResponse(weakConn, resp);
+					});
+			});
+		}
+		catch(const std::exception& e)
+		{
+			LOG_ERROR << "Accidental HTTP handler failed: " << e.what();
+			if(auto connection = weakConn.lock())
+				connection->forceClose();
+		}
+		catch(...)
+		{
+			LOG_ERROR << "Accidental HTTP handler failed";
+			if(auto connection = weakConn.lock())
+				connection->forceClose();
+		}
+	});
+}
+
+void SpartanServer::sendAccidentalHttpResponse(const std::weak_ptr<TcpConnection>& weakConn,
+                                               const HttpResponsePtr& resp)
+{
+	auto conn = weakConn.lock();
+	if(!conn || !conn->connected())
+		return;
+	auto state = conn->getContext<SpartanParseState>();
+	if(!state || state->phase != SpartanParseState::Phase::AwaitingHttpResponse)
+		return;
+	if(!resp || resp->body().size() > kMaxHttpBodyBytes ||
+	   !resp->sendfileName().empty() || resp->streamCallback() || resp->asyncStreamCallback())
+	{
+		conn->forceClose();
+		return;
+	}
+	const int status = resp->statusCode();
+	if(status < 200 || status > 599)
+	{
+		conn->forceClose();
+		return;
+	}
+	const bool noBody = state->http_head_request || status == 204 || status == 205 || status == 304;
+	state->http_body = noBody ? std::string{} : std::string(resp->body());
+	state->http_body_offset = 0;
+	state->http_send_step = 0;
+	state->phase = SpartanParseState::Phase::SendingHttpResponse;
+	std::string header = "HTTP/1.1 " + std::to_string(status) + " " + httpReason(status) + "\r\n";
+	header += "Connection: close\r\n";
+	header += "Content-Length: " +
+	          std::to_string(state->http_head_request ? resp->body().size() : state->http_body.size()) +
+	          "\r\n";
+	const auto contentType = resp->contentTypeString();
+	if(!contentType.empty() && validHttpFieldValue(contentType))
+		header += "Content-Type: " + contentType + "\r\n";
+	for(const auto& [name, value] : resp->headers())
+	{
+		if(name == "connection" || name == "content-length" ||
+		   name == "content-type" || name == "transfer-encoding" ||
+		   name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos ||
+		   !validHttpFieldValue(value))
+			continue;
+		header += name + ": " + value + "\r\n";
+	}
+	header += "\r\n";
+	if(header.size() > kMaxHttpResponseHeaderBytes)
+	{
+		conn->forceClose();
+		return;
+	}
+	conn->send(header);
+	if(state->http_body.empty())
+	{
+		state->phase = SpartanParseState::Phase::Dispatched;
+		conn->shutdown();
+		conn->getLoop()->runAfter(2, [weakConn]() {
+			if(auto connection = weakConn.lock())
+				connection->forceClose();
+		});
+		return;
+	}
+	conn->getLoop()->runAfter(kHttpStepSeconds, [weakConn]() {
+		SpartanServer::sendAccidentalHttpBody(weakConn);
+	});
+}
+
+void SpartanServer::sendAccidentalHttpBody(const std::weak_ptr<TcpConnection>& weakConn)
+{
+	auto conn = weakConn.lock();
+	if(!conn || !conn->connected())
+		return;
+	auto state = conn->getContext<SpartanParseState>();
+	if(!state || state->phase != SpartanParseState::Phase::SendingHttpResponse)
+		return;
+	++state->http_send_step;
+	const auto target = state->http_body.size() * state->http_send_step / kHttpSendSteps;
+	if(target > state->http_body_offset)
+	{
+		conn->send(state->http_body.data() + state->http_body_offset,
+		           target - state->http_body_offset);
+		state->http_body_offset = target;
+	}
+	if(state->http_send_step == kHttpSendSteps)
+	{
+		state->phase = SpartanParseState::Phase::Dispatched;
+		state->http_body.clear();
+		conn->shutdown();
+		return;
+	}
+	conn->getLoop()->runAfter(kHttpStepSeconds, [weakConn]() {
+		SpartanServer::sendAccidentalHttpBody(weakConn);
+	});
+}
+
 void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 {
 	auto context = conn->getContext<SpartanParseState>();
@@ -159,9 +425,21 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 		conn->forceClose();
 		return;
 	}
+	if(context->phase == SpartanParseState::Phase::AwaitingHttpResponse ||
+	   context->phase == SpartanParseState::Phase::SendingHttpResponse)
+	{
+		if(buf->readableBytes() > kMaxHttpInputBytes - context->http_input_bytes)
+		{
+			conn->forceClose();
+			return;
+		}
+		context->http_input_bytes += buf->readableBytes();
+		buf->retrieveAll();
+		return;
+	}
 	if(context->phase == SpartanParseState::Phase::Dispatched)
 	{
-		LOG_WARN << "Received data after complete Spartan request";
+		LOG_WARN << "Received data after complete request";
 		buf->retrieveAll();
 		conn->forceClose();
 		return;
@@ -210,6 +488,22 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 		return;
 	}
 	const std::string_view header(buf->peek(), headerBytes);
+	if(getAccidentalHttpHandler())
+	{
+		if(auto httpReq = parseHttpRequestLine(header))
+		{
+			buf->retrieve(headerBytes + 2);
+			if(buf->readableBytes() > kMaxHttpInputBytes)
+			{
+				conn->forceClose();
+				return;
+			}
+			context->http_input_bytes = buf->readableBytes();
+			buf->retrieveAll();
+			processAccidentalHttpRequest(std::move(httpReq), conn);
+			return;
+		}
+	}
 	HttpRequestPtr req;
 	size_t content_length;
 	try {
@@ -249,11 +543,6 @@ void SpartanServer::rejectRequest(const TcpConnectionPtr &conn, const std::strin
 	sendResponseBack(conn, resp);
 }
 
-
-void SpartanServer::setIoLoopThreadPool(const std::shared_ptr<EventLoopThreadPool>& pool)
-{
-    server_.setIoLoopThreadPool(pool);
-}
 
 void SpartanServer::sendResponseBack(const TcpConnectionPtr& conn, const HttpResponsePtr& resp)
 {

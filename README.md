@@ -158,3 +158,26 @@ Gemini URLs supports a query parameter using the `?` symbol. For example, `gemin
 
 Spartoi adds a `protocol` header to the proxyed HTTP request to singnal it's comming from a Gemini request. Whom's value is always "spartoi"
 
+### Handling HTTP requests by bots
+
+As Spartan is a raw TCP protocl, Spartan servers often gets scanned by bots to find hidden HTTP services.  Spartoi supples `registerAccidentalHttpHandler()` that when set, allows you to handle HTTP 1.1/1.0 requests that somehow landed on your Spartan server. The routing machinism is completely seperate from the router of Drogon - so you can implement your own tarpit or honeypot.
+
+With no handler registered, spartoi retains its usual Spartan error response.
+
+```cpp
+spartoi::registerAccidentalHttpHandler(
+    [](drogon::HttpRequestPtr&& req,
+       spartoi::AccidentalHttpCallback&& callback) {
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        if (req->path() == "/admin") {
+            resp->setBody("<html><title>Admin</title><body>Loading...</body></html>");
+        } else {
+            resp->setBody("<html><title>Welcome</title><body>Welcome</body></html>");
+        }
+        resp->setContentTypeCodeAndCustomString(drogon::CT_CUSTOM, "text/html");
+        callback(resp);
+    });
+```
+
+Spartoi sends a raw HTTP/1.1 response with `Connection: close` and a paced body. It allows at most 16 concurrent accidental HTTP responses across the plugin, 16 KiB of additional incoming data, an 8 KiB response header, and a 64 KiB response body. The handler has 10 seconds to call the callback; the connection has a 45-second hard deadline. File and stream responses are not supported on this path.
+
