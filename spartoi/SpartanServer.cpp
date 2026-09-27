@@ -492,6 +492,7 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 	{
 		if(auto httpReq = parseHttpRequestLine(header))
 		{
+			LOG_INFO << "HTTP request path received on Spartan port: " << httpReq->path();
 			buf->retrieve(headerBytes + 2);
 			if(buf->readableBytes() > kMaxHttpInputBytes)
 			{
