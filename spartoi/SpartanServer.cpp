@@ -234,6 +234,9 @@ void SpartanServer::processFinishedRequest(const HttpRequestPtr& req, trantor::T
 	if(!state)
 		return;
 	state->phase = SpartanParseState::Phase::Dispatched;
+	// Preserve trusted socket metadata before forwarding the synthetic request.
+	req->getAttributes()->insert("peer_ip", conn->peerAddr().toIp());
+	req->getAttributes()->insert("protocol", std::string{"spartan"});
 	const auto threadCount = app().getThreadNum();
 	if(threadCount == 0)
 	{
