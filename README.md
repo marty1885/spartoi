@@ -179,5 +179,5 @@ spartoi::registerAccidentalHttpHandler(
     });
 ```
 
-Spartoi sends a raw HTTP/1.1 response with `Connection: close` and a paced body. It allows at most 16 concurrent accidental HTTP responses across the plugin, 16 KiB of additional incoming data, an 8 KiB response header, and a 64 KiB response body. The handler has 10 seconds to call the callback; the connection has a 45-second hard deadline. File and stream responses are not supported on this path.
+Spartoi sends a raw HTTP/1.1 response with `Connection: close` and a paced body. It allows at most 16 concurrent accidental HTTP responses across the plugin and four per socket peer IP address. It allows 16 KiB of additional incoming data, an 8 KiB response header, and a 64 KiB response body. The handler has 10 seconds to call the callback; the connection has a 45-second hard deadline. File and stream responses are not supported on this path.
 

@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <trantor/net/EventLoop.h>
 #include <trantor/net/InetAddress.h>
 #include <trantor/net/TcpServer.h>
@@ -32,7 +34,7 @@ struct SpartanParseState
 	size_t header_scan_offset = 0;
 	Phase phase = Phase::AwaitingHeader;
 	bool connection_permit = false;
-	bool http_permit = false;
+	std::string http_peer_ip;
 	bool http_head_request = false;
 	size_t http_input_bytes = 0;
 	std::string http_body;
@@ -43,7 +45,9 @@ struct SpartanParseState
 struct SpartanConnectionLimits
 {
 	std::atomic_size_t active_connections{0};
-	std::atomic_size_t active_http_responses{0};
+	std::mutex http_mutex;
+	size_t active_http_responses = 0;
+	std::unordered_map<std::string, size_t> active_http_by_peer;
 };
 
 class SpartanServer : public trantor::NonCopyable

@@ -18,6 +18,8 @@ constexpr size_t kMaxRequestBodyBytes = 32 * 1024 * 1024;
 constexpr size_t kMaxConnections = 256;
 constexpr double kRequestDeadlineSeconds = 60;
 constexpr size_t kMaxHttpResponses = 16;
+constexpr size_t kMaxHttpResponsesPerPeer = 4;
+constexpr size_t kMaxLoggedHttpPathBytes = 160;
 constexpr size_t kMaxHttpInputBytes = 16 * 1024;
 constexpr size_t kMaxHttpResponseHeaderBytes = 8 * 1024;
 constexpr size_t kMaxHttpBodyBytes = 64 * 1024;
@@ -131,10 +133,14 @@ void SpartanServer::onConnection(const TcpConnectionPtr& conn)
 			state->connection_permit = false;
 			limits_->active_connections.fetch_sub(1, std::memory_order_release);
 		}
-		if(state && state->http_permit)
+		if(state && !state->http_peer_ip.empty())
 		{
-			state->http_permit = false;
-			limits_->active_http_responses.fetch_sub(1, std::memory_order_release);
+			std::lock_guard lock(limits_->http_mutex);
+			auto peer = limits_->active_http_by_peer.find(state->http_peer_ip);
+			if(--peer->second == 0)
+				limits_->active_http_by_peer.erase(peer);
+			--limits_->active_http_responses;
+			state->http_peer_ip.clear();
 		}
 		return;
 	}
@@ -263,18 +269,28 @@ void SpartanServer::processAccidentalHttpRequest(HttpRequestPtr req, const TcpCo
 	auto state = conn->getContext<SpartanParseState>();
 	if(!state)
 		return;
-	auto current = limits_->active_http_responses.load(std::memory_order_relaxed);
-	while(current < kMaxHttpResponses &&
-	      !limits_->active_http_responses.compare_exchange_weak(current, current + 1,
-	                                                std::memory_order_acquire,
-	                                                std::memory_order_relaxed))
-	{}
-	if(current >= kMaxHttpResponses)
+	auto peerIp = conn->peerAddr().toIp();
+	{
+		std::lock_guard lock(limits_->http_mutex);
+		auto peer = limits_->active_http_by_peer.find(peerIp);
+		if(limits_->active_http_responses < kMaxHttpResponses &&
+		   (peer == limits_->active_http_by_peer.end() || peer->second < kMaxHttpResponsesPerPeer))
+		{
+			++limits_->active_http_by_peer[peerIp];
+			++limits_->active_http_responses;
+			state->http_peer_ip = std::move(peerIp);
+		}
+	}
+	if(state->http_peer_ip.empty())
 	{
 		conn->forceClose();
 		return;
 	}
-	state->http_permit = true;
+	const std::string_view path = req->path();
+	LOG_INFO << "HTTP decoy request on Spartan port: " << req->methodString() << ' '
+	         << std::string(path.substr(0, kMaxLoggedHttpPathBytes))
+	         << (path.size() > kMaxLoggedHttpPathBytes ? "..." : "")
+	         << " peer=" << state->http_peer_ip;
 	state->http_head_request = req->method() == Head;
 	state->phase = SpartanParseState::Phase::AwaitingHttpResponse;
 	const std::weak_ptr<TcpConnection> weakConn = conn;
@@ -282,7 +298,7 @@ void SpartanServer::processAccidentalHttpRequest(HttpRequestPtr req, const TcpCo
 		if(auto connection = weakConn.lock())
 		{
 			auto parseState = connection->getContext<SpartanParseState>();
-			if(parseState && parseState->http_permit)
+			if(parseState && !parseState->http_peer_ip.empty())
 				connection->forceClose();
 		}
 	});
@@ -495,7 +511,6 @@ void SpartanServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
 	{
 		if(auto httpReq = parseHttpRequestLine(header))
 		{
-			LOG_INFO << "HTTP request path received on Spartan port: " << httpReq->path();
 			buf->retrieve(headerBytes + 2);
 			if(buf->readableBytes() > kMaxHttpInputBytes)
 			{
